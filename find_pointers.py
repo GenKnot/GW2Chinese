@@ -24,6 +24,7 @@ MEM_PRIVATE = 0x20000
 PAGE_GUARD = 0x100
 WRITABLE = (0x04, 0x08, 0x40, 0x80)
 CHUNK = 1 << 24  # 16MB
+LOW, HIGH = 0x10000, 0x7FFFFFFFFFFF  # 用户态指针的合理范围
 
 
 class MBI(ctypes.Structure):
@@ -116,31 +117,67 @@ def find_paths(pm, cands):
     slots = np.frombuffer(image[: size - size % 8], dtype="<u8")
     target = set(int(c) for c in cands)
     # 只取非零、看起来像用户态堆指针的槽位
-    ok = np.nonzero((slots > 0x10000) & (slots < 0x7FFFFFFFFFFF))[0]
+    ok = np.nonzero((slots > LOW) & (slots < HIGH))[0]
     tails = []
     for _, offs in POINTER_PATHS:
         if offs not in tails:
             tails.append(offs)
 
-    found = []
-    for i in ok.tolist():
-        p0 = int(slots[i])
-        for offs in tails:
+    # 偏移链按前缀合并成树，共享前面几层的读取；中间值不像指针就整枝剪掉
+    root = {"kids": {}, "lasts": []}
+    for offs in tails:
+        node = root
+        for off in offs[:-1]:
+            node = node["kids"].setdefault(off, {"kids": {}, "lasts": []})
+        node["lasts"].append(offs)
+
+    pages = {}
+
+    def read8(addr):
+        pg = addr >> 12
+        if (addr & 0xFFF) > 0xFF8:
             try:
-                a = p0
-                for off in offs[:-1]:
-                    a = int.from_bytes(pm.read_bytes(a + off, 8), "little")
-                a += offs[-1]
+                return int.from_bytes(pm.read_bytes(addr, 8), "little")
             except Exception:
-                continue
-            if a in target:
-                found.append((i * 8, offs))
+                return None
+        if pg not in pages:
+            if len(pages) > 100_000:
+                pages.clear()
+            try:
+                pages[pg] = pm.read_bytes(pg << 12, 4096)
+            except Exception:
+                pages[pg] = None
+        data = pages[pg]
+        if data is None:
+            return None
+        o = addr & 0xFFF
+        return int.from_bytes(data[o:o + 8], "little")
+
+    found = []
+
+    def walk(node, a, slot):
+        for offs in node["lasts"]:
+            if a + offs[-1] in target:
+                found.append((slot, offs))
+        for off, child in node["kids"].items():
+            v = read8(a + off)
+            if v is not None and LOW < v < HIGH:
+                walk(child, v, slot)
+
+    total = len(ok)
+    for n, i in enumerate(ok.tolist()):
+        if n % 100_000 == 0:
+            print(f"  进度 {n}/{total}，已找到 {len(found)} 条", flush=True)
+        walk(root, int(slots[i]), i * 8)
     return found
 
 
 def main():
     pm = pymem.Pymem(BASE_MODULE)
-    cands = find_candidates(pm)
+    if len(sys.argv) > 1:  # 直接传入上次扫出的候选地址（十六进制），跳过语言扫描
+        cands = np.array([int(x, 16) for x in sys.argv[1:]], dtype=np.uint64)
+    else:
+        cands = find_candidates(pm)
     print(f"\n候选地址：{[hex(int(c)) for c in cands]}")
     print("正在静态区反推指针路径（可能需要几十秒）……")
     found = find_paths(pm, cands)
